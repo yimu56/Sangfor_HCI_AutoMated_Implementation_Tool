@@ -1,0 +1,17 @@
+# 默认按文本处理并统一为 LF，避免跨平台换行噪音
+* text=auto eol=lf
+
+# 批处理必须保持 CRLF，否则 Windows 下执行异常
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源，禁止换行转换
+*.png binary
+*.ico binary
+*.exe binary
+*.syso binary
+*.har binary
+
+# 让 git 在 diff 时把 go.sum / 生成的资源当二进制看待（可选）
+go.sum -diff
