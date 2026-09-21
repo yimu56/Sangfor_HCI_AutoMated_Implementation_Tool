@@ -40,10 +40,26 @@
 //  3. GET  /vapi/json/log/process?upid=<task_id>     轮询任务（process=0 表示进行中）
 //
 // GUI 说明:
-//   - 登录成功后自动刷新 节点/网口/虚拟机/硬件 数据
+//   - 登录成功后自动刷新 节点/网口/虚拟机/硬件/网络配置 数据
 //   - 修改网口配置页面: 选择节点 -> 选择网口 -> 修改字段 -> 预览变更 -> 确认提交
 //   - 修改网口跳过密码二次校验（VerifyPassword），直接提交，后续人工验证
 //   - 会话与上次输入默认值缓存在可执行文件同目录（.sangfor-session.json / .sangfor-lastinput.json）
+//
+// 网络配置页（4 类写操作，协议见 netcfg.go，界面见 netcfg_ui.go / netcfg_pages.go）:
+//
+//	VXLAN IP 池   读 GET  /vapi/extjs/network/v1.0/vxlan-ip-pools?start=0&limit=20
+//	              写 POST /vapi/extjs/network/v1.0/vxlan-ip-pools            (JSON)
+//	端口聚合      写 POST /vapi/json/cluster/network/bonds                 (form)
+//	              读: 无独立接口，取 /cluster/network/ifaces 中 type=bond 的元素
+//	存储网        读 GET  /vapi/extjs/vs/vs_config/vs_networksetting_get?add_host=0
+//	              验 POST /vapi/json/vs/vs_config/vs_check_arbiter_same_netip (form)
+//	              写 POST /vapi/extjs/vs/vs_config/vs_networksetting_set      (form)
+//	                 → data 直接是 UPID 字符串（不是 task_id 字段）
+//	              回读 GET /vapi/extjs/vs/vs_config/is_net_config → type: NONE → standard_network
+//	业务口        读 GET  /vapi/json/cluster/network/business-ifaces[?refresh=1]
+//	              验 POST /vapi/json/asan/v1.0/networks/ifacecheck           (JSON)
+//	              写 POST /vapi/json/hci/sdn/ui/network-portal/nodes/action   (JSON)
+//	                 bridge_list 是"内层 JSON 字符串"，拓扑节点 ID 由客户端生成 UUIDv4
 //
 // 历史命令行版保留在 main_cli_backup.go，需要可自行取回。
 package main
@@ -68,6 +84,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
@@ -1475,6 +1492,16 @@ func uiWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	}
+	// 最大化/还原：不用系统的 zoom，自己把窗口铺满工作区（见 toggleOwnMaximize 注释）。
+	// 这是"最大化后标题栏按钮不可见"的根本解法 —— 不再依赖布局最小尺寸与屏幕尺寸的比较。
+	if msg == win.WM_SYSCOMMAND && theApp != nil && theApp.MainWindow != nil {
+		switch wParam & 0xFFF0 {
+		case win.SC_MAXIMIZE, win.SC_RESTORE:
+			if toggleOwnMaximize(theApp.MainWindow) {
+				return 0
+			}
+		}
+	}
 	return win.CallWindowProc(oldWndProc, hwnd, msg, wParam, lParam)
 }
 
@@ -1769,6 +1796,10 @@ type App struct {
 	selIfaces []Iface
 	selIface  *Iface
 	linkVals  []int
+
+	// 4 个网络配置页（VXLAN IP 池 / 端口聚合 / 存储网 / 业务口）
+	// 实现见 netcfg_ui.go（控件与模型）+ netcfg_pages.go（页面与业务逻辑）
+	nc *netCfgPages
 }
 
 // post 后台 goroutine 完成后通知 UI 线程
@@ -1808,6 +1839,9 @@ func (a *App) handleEvent(ev uiEvent) {
 		a.nodeModel.items = a.nodes
 		a.nodeModel.PublishRowsReset()
 		a.fillNodeCombo()
+		if a.nc != nil {
+			a.nc.rebuildNodePickers()
+		}
 		a.setStatus(fmt.Sprintf("节点 %d 个", len(a.nodes)))
 	case "ifaces_done":
 		rows := ev.data.([]ifaceRow)
@@ -1873,6 +1907,9 @@ func (a *App) handleEvent(ev uiEvent) {
 			a.setStatus("任务执行失败")
 			walk.MsgBox(a, "任务失败", ev.err.Error(), walk.MsgBoxIconError)
 		}
+	default:
+		// 4 个网络配置页的事件（netcfg_pages.go）
+		a.handleNetCfgEvent(ev)
 	}
 }
 
@@ -2193,6 +2230,9 @@ func (a *App) refreshAll() {
 	go a.fetchVXLAN()
 	go a.fetchVMs()
 	go a.fetchHW()
+	if a.nc != nil {
+		a.nc.refreshAll()
+	}
 }
 
 // refreshIfaces 仅刷新网口表格
@@ -2478,6 +2518,149 @@ func addCol(tv *walk.TableView, title string, width int) {
 	_ = tv.Columns().Add(c)
 }
 
+func workAreaOf(mw *walk.MainWindow) (int, int, int, int) {
+	hmon := win.MonitorFromWindow(mw.Handle(), win.MONITOR_DEFAULTTONEAREST)
+	var mi win.MONITORINFO
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+	if win.GetMonitorInfo(hmon, &mi) {
+		return int(mi.RcWork.Left), int(mi.RcWork.Top),
+			int(mi.RcWork.Right - mi.RcWork.Left), int(mi.RcWork.Bottom - mi.RcWork.Top)
+	}
+	return 0, 0, 0, 0
+}
+
+// windowRestore 记录"自己实现最大化"之前的窗口矩形
+type windowRestore struct {
+	on         bool
+	x, y, w, h int
+}
+
+var ownMax windowRestore
+
+// applyWindowGeometry 按显示器工作区决定窗口矩形（尺寸 + 居中），直接用 Win32 设定。
+// 幂等：可以在 Run() 之后重复调用（walk 会在 Run() 里按布局最小尺寸把窗口撑大一次）。
+//
+// 为什么不用 walk 的 SetSize / SetBoundsPixels：
+//
+//	实测在 DPI≠96 时这两者的语义不可预期 —— SetSize 收的是 96DPI 逻辑单位却按"客户区/窗口"
+//	混算，200% 缩放下算出来的窗口会比整块屏幕还大（1280x780 → 2560x1560 像素 > 1280x800 逻辑屏），
+//	而且 show() 之后 walk 还会再按自己的逻辑改一次尺寸。表现就是：窗口一打开右半边在屏幕外、
+//	底部压到任务栏下面，用户连右上角的标题栏按钮都点不到。
+//
+// 这里改成"自己算"：工作区（像素）− 目标客户区（DIP×DPI/96 + 非客户区）→ 一次 SetWindowPos 搞定，
+// 结果稳定可预期（窗口完整落在工作区内并居中）。walk 的布局照样会响应 WM_SIZE 正常排布内容。
+func applyWindowGeometry(mw *walk.MainWindow, wantW, wantH int) {
+	_, _, waW, waH := workAreaOf(mw)
+	if waW <= 0 || waH <= 0 {
+		return
+	}
+	dpi := int(win.GetDpiForWindow(mw.Handle()))
+	if dpi <= 0 {
+		dpi = 96
+	}
+	// 当前"窗口 − 客户区"的差值就是非客户区（标题栏 + 边框）的高度/宽度
+	var wr, cr win.RECT
+	win.GetWindowRect(mw.Handle(), &wr)
+	win.GetClientRect(mw.Handle(), &cr)
+	ncW := int(wr.Right-wr.Left) - int(cr.Right-cr.Left)
+	ncH := int(wr.Bottom-wr.Top) - int(cr.Bottom-cr.Top)
+	if ncW < 0 {
+		ncW = 0
+	}
+	if ncH < 0 {
+		ncH = 0
+	}
+	// 布局所需的最小客户区尺寸（像素）。取它和"期望尺寸"的较大者，
+	// 但一律不超过工作区：内容再多也不能让窗口超出屏幕（否则最大化会吃掉标题栏，
+	// 底部还会压到任务栏下面）。
+	minSz := walk.Size{}
+	if li := walk.CreateLayoutItemsForContainer(mw); li != nil {
+		minSz = li.MinSizeForSize(walk.Size{Width: waW - ncW, Height: waH - ncH})
+	}
+	needW := wantW*dpi/96 + ncW
+	needH := wantH*dpi/96 + ncH
+	if int(minSz.Width)+ncW > needW {
+		needW = int(minSz.Width) + ncW
+	}
+	if int(minSz.Height)+ncH > needH {
+		needH = int(minSz.Height) + ncH
+	}
+	tw, th := needW, needH
+	if tw > waW-16 {
+		tw = waW - 16
+	}
+	if th > waH-16 {
+		th = waH - 16
+	}
+	if tw < 480 {
+		tw = 480
+	}
+	if th < 360 {
+		th = 360
+	}
+	win.SetWindowPos(mw.Handle(), 0, 0, 0, int32(tw), int32(th),
+		win.SWP_NOMOVE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+	moveWindowCentered(mw)
+}
+
+// toggleOwnMaximize 自己实现"最大化/还原"：把窗口铺满显示器工作区，而不是用系统的 zoom。
+// 返回 true 表示消息已被处理。
+//
+// 为什么要自己实现：实测在本环境（200% 缩放 / 1280x800 逻辑屏）用系统的最大化会把客户区
+// 扩成整个窗口，标题栏（最小化/最大化/关闭）被内容覆盖 —— 三个按钮不可见也点不到，
+// 用户既无法还原也无法关闭窗口。自己把窗口缩放到工作区大小，标题栏始终保留、按钮始终可用。
+func toggleOwnMaximize(mw *walk.MainWindow) bool {
+	waX, waY, waW, waH := workAreaOf(mw)
+	if waW <= 0 || waH <= 0 {
+		return false
+	}
+	if ownMax.on {
+		win.SetWindowPos(mw.Handle(), 0, int32(ownMax.x), int32(ownMax.y),
+			int32(ownMax.w), int32(ownMax.h), win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+		ownMax.on = false
+		return true
+	}
+	var wr win.RECT
+	win.GetWindowRect(mw.Handle(), &wr)
+	ownMax = windowRestore{
+		on: true,
+		x:  int(wr.Left), y: int(wr.Top),
+		w: int(wr.Right - wr.Left), h: int(wr.Bottom - wr.Top),
+	}
+	win.SetWindowPos(mw.Handle(), 0, int32(waX), int32(waY), int32(waW), int32(waH),
+		win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+	return true
+}
+
+// moveWindowCentered 只调整窗口位置（工作区内居中），不改尺寸。
+//
+// 必须带 SWP_NOSIZE：这样 walk 会跳过它自己的重新布局分支
+// （见 walk form.go 的 WM_WINDOWPOSCHANGED：flags 带 SWP_NOSIZE 就直接 break），
+// 否则每调一次都会被 walk 改一次窗口高度（实测 1469 → 1693）。
+func moveWindowCentered(mw *walk.MainWindow) {
+	waX, waY, waW, waH := workAreaOf(mw)
+	if waW <= 0 || waH <= 0 {
+		return
+	}
+	var wr win.RECT
+	win.GetWindowRect(mw.Handle(), &wr)
+	tw := int(wr.Right - wr.Left)
+	th := int(wr.Bottom - wr.Top)
+	if tw <= 0 || th <= 0 {
+		return
+	}
+	x := waX + (waW-tw)/2
+	y := waY + (waH-th)/2
+	if x < waX {
+		x = waX
+	}
+	if y < waY {
+		y = waY
+	}
+	win.SetWindowPos(mw.Handle(), 0, int32(x), int32(y), 0, 0,
+		win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE)
+}
+
 // ---------- 界面搭建 ----------
 
 func newApp() (*App, error) {
@@ -2496,8 +2679,10 @@ func newApp() (*App, error) {
 	if err := mw.SetLayout(walk.NewVBoxLayout()); err != nil {
 		return nil, err
 	}
-	mw.SetSize(walk.Size{Width: 1080, Height: 720})
-	mw.SetMinMaxSize(walk.Size{Width: 800, Height: 560}, walk.Size{Width: 0, Height: 0})
+	// 页签较多（6 个查询/改口页 + 4 个网络配置页），窗口的最小宽度给大一些避免页签被折叠。
+	// 注意：窗口的初始尺寸/位置不在这里设 —— 见 applyWindowGeometry（必须等窗口创建、
+	// show() 之后才有真实 DPI 与非客户区尺寸可算）。
+	mw.SetMinMaxSize(walk.Size{Width: 900, Height: 600}, walk.Size{Width: 0, Height: 0})
 
 	// ---- 顶部登录栏 ----
 	topBar, err := walk.NewComposite(mw)
@@ -2774,6 +2959,11 @@ func newApp() (*App, error) {
 	}
 	a.notebook.Pages().Add(setPage)
 
+	// ---- 4 个网络配置页（VXLAN IP 池 / 端口聚合 / 存储网 / 业务口）----
+	if a.nc, err = buildNetCfgPages(a, a.notebook); err != nil {
+		return nil, err
+	}
+
 	// 菜单
 	fileMenu, _ := walk.NewMenu()
 	fileAction, _ := mw.Menu().Actions().AddMenu(fileMenu)
@@ -2882,5 +3072,23 @@ func main() {
 		os.Exit(1)
 	}
 	a.Show()
+	// 窗口显示后再定尺寸/位置：此时才有真实 DPI 与非客户区高度可算。
+	//
+	// 目标尺寸的取法：
+	//   宽度 1240 DIP —— 够放下 10 个页签（页签被折叠就没有入口了）；
+	//   高度 560 DIP —— **故意小于布局的最小高度**：walk 会把窗口收敛到"布局最小尺寸"
+	//     （实测 2480x1359 客户区），这个尺寸正好装得下内容、又不会比屏幕还高。
+	//     窗口一旦高过屏幕，Windows 最大化时会把客户区扩成整窗、标题栏（最小化/最大化/关闭）
+	//     被内容盖住 —— 这正是本次要修的问题，所以不能让窗口"越高越好"。
+	applyWindowGeometry(a.MainWindow, 1240, 560)
+	// walk 会在 Run() 里再按"布局最小尺寸"把窗口撑大一次（form.go: Run → SetBoundsPixels），
+	// 且布局最小尺寸会随数据（复选框行数）变化，所以 Run() 之后再幂等收敛几次。
+	// 用 Synchronize 保证在 UI 线程执行。
+	for _, d := range []time.Duration{300 * time.Millisecond, 900 * time.Millisecond,
+		1800 * time.Millisecond} {
+		time.AfterFunc(d, func() {
+			a.Synchronize(func() { applyWindowGeometry(a.MainWindow, 1240, 560) })
+		})
+	}
 	a.Run()
 }
