@@ -1,10 +1,12 @@
 # ---- 运行期生成（含明文口令 / 会话令牌，切勿提交）----
 .sangfor-session.json
 .sangfor-lastinput.json
+.sangfor-config.json
 
 # ---- 抓包文件（含真实地址与口令密文）----
 *.har
 *.pcap
+/har/
 
 # ---- 构建产物 ----
 *.exe

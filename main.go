@@ -72,11 +72,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -547,48 +547,15 @@ func NewClient(host string) *Client {
 	}
 }
 
-// do 发送请求并返回响应体与响应头
+// do 发送表单请求（form-urlencoded）—— 只是 doBody 的薄封装。
+//
+// 收敛到 doBody 的意义：所有请求都从同一个出口发出，调试抓包（harcapture.go）
+// 只需挂在这一个出口上就能覆盖"任何涉及网络的操作"。
 func (c *Client) do(method, path string, form url.Values) ([]byte, http.Header, error) {
-	var bodyReader io.Reader
-	if form != nil {
-		bodyReader = strings.NewReader(form.Encode())
+	if form == nil {
+		return c.doBody(method, path, "", nil)
 	}
-	req, err := http.NewRequest(method, c.baseURL+path, bodyReader)
-	if err != nil {
-		return nil, nil, err
-	}
-	if form != nil {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	}
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "zh_CN")
-	req.Header.Set("Referer", c.baseURL+"/login")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	if c.token != "" {
-		req.Header.Set("CSRFPreventionToken", c.token)
-	}
-	if c.cookie != "" {
-		req.Header.Set("Cookie", c.cookie)
-	}
-	// 业务查询阶段 Referer 指向主页面（与浏览器行为一致）
-	if strings.Contains(path, "/vapi/") && c.cookie != "" {
-		req.Header.Set("Referer", c.baseURL+"/")
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("请求 %s 失败: %w", path, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return body, resp.Header, fmt.Errorf("请求 %s 返回 HTTP %d: %s", path, resp.StatusCode, truncate(string(body), 200))
-	}
-	return body, resp.Header, nil
+	return c.doBody(method, path, "application/x-www-form-urlencoded; charset=UTF-8", []byte(form.Encode()))
 }
 
 // callAPI 调用 vapi 接口并校验 success=1
@@ -1744,6 +1711,21 @@ func (m *vmModel) Value(row, col int) interface{} {
 
 // ---------- 主窗口 ----------
 
+// appCfg 运行配置（启动时从配置文件读取一次；修改后需重启生效）
+var appCfg appConfig
+
+// openInExplorer 用资源管理器打开目录或定位文件（Windows）
+func openInExplorer(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	if fi, statErr := os.Stat(abs); statErr == nil && !fi.IsDir() {
+		return exec.Command("explorer", "/select,"+abs).Start()
+	}
+	return exec.Command("explorer", abs).Start()
+}
+
 type App struct {
 	*walk.MainWindow
 	eventCh chan uiEvent
@@ -2684,6 +2666,14 @@ func newApp() (*App, error) {
 	// show() 之后才有真实 DPI 与非客户区尺寸可算）。
 	mw.SetMinMaxSize(walk.Size{Width: 900, Height: 600}, walk.Size{Width: 0, Height: 0})
 
+	// ---- 运行配置 & 调试抓包 ----
+	cfg, cfgErr := loadAppConfig()
+	appCfg = cfg
+	harInit(cfg)
+	if cfgErr != nil {
+		fmt.Fprintln(os.Stderr, "配置加载提示:", cfgErr)
+	}
+
 	// ---- 顶部登录栏 ----
 	topBar, err := walk.NewComposite(mw)
 	if err != nil {
@@ -2988,6 +2978,34 @@ func newApp() (*App, error) {
 	loginItem.SetText("重新登录(&L)")
 	loginItem.Triggered().Attach(func() { a.onLogin() })
 	opMenu.Actions().Add(loginItem)
+
+	// 调试菜单：抓包开关状态（配置文件控制）+ 打开抓包目录 / 配置文件
+	debugMenu, _ := walk.NewMenu()
+	debugAction, _ := mw.Menu().Actions().AddMenu(debugMenu)
+	debugAction.SetText("调试(&D)")
+	harStatItem := walk.NewAction()
+	harStatItem.SetText(harStatusText(appCfg))
+	harStatItem.SetEnabled(false)
+	debugMenu.Actions().Add(harStatItem)
+	harOpenItem := walk.NewAction()
+	harOpenItem.SetText("打开抓包目录(&H)")
+	harOpenItem.SetEnabled(harEnabled())
+	harOpenItem.Triggered().Attach(func() {
+		dir := appCfg.harRootDir()
+		_ = os.MkdirAll(dir, 0700)
+		if err := openInExplorer(dir); err != nil {
+			walk.MsgBox(a, "打开失败", err.Error(), walk.MsgBoxIconError)
+		}
+	})
+	debugMenu.Actions().Add(harOpenItem)
+	cfgOpenItem := walk.NewAction()
+	cfgOpenItem.SetText("打开配置文件(&C)（改 capture_har 后需重启）")
+	cfgOpenItem.Triggered().Attach(func() {
+		if err := openInExplorer(appConfigFile()); err != nil {
+			walk.MsgBox(a, "打开失败", err.Error(), walk.MsgBoxIconError)
+		}
+	})
+	debugMenu.Actions().Add(cfgOpenItem)
 
 	// 预填上次登录信息
 	if sess, err := loadSession(); err == nil {

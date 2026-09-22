@@ -63,15 +63,21 @@ func (c *Client) doBody(method, path, contentType string, body []byte) ([]byte, 
 		req.Header.Set("Referer", c.baseURL+"/")
 	}
 
+	// 调试抓包：这里是全部 HTTP 请求的唯一出口（do() 也走这里），
+	// 只要配置文件里 debug.capture_har=true，任何涉及网络的操作都会被记录成 HAR。
+	reqStart := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
+		harRecord(req, body, 0, nil, nil, time.Since(reqStart), err)
 		return nil, nil, fmt.Errorf("请求 %s 失败: %w", path, err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		harRecord(req, body, resp.StatusCode, resp.Header, nil, time.Since(reqStart), err)
 		return nil, nil, err
 	}
+	harRecord(req, body, resp.StatusCode, resp.Header, respBody, time.Since(reqStart), nil)
 	if resp.StatusCode != http.StatusOK {
 		return respBody, resp.Header, fmt.Errorf("请求 %s 返回 HTTP %d: %s",
 			path, resp.StatusCode, truncate(string(respBody), 200))
