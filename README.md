@@ -68,7 +68,7 @@
 **不需要 gcc**（全项目 CGO_ENABLED=0，仅依赖纯 Go 的 `lxn/walk`）。
 
 ```bash
-git clone https://github.com/yimu56/hci-tool.git
+git clone https://github.com/yimu56/Sangfor_HCI_AutoMated_Implementation_Tool.git
 cd hci-tool
 go mod download
 go build -trimpath -ldflags "-H windowsgui -s -w" -o sangfor-ifaces-gui.exe .
