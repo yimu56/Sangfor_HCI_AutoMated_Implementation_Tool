@@ -64,7 +64,7 @@
 
 ### 方式二：从源码构建
 
-环境要求：**Go 1.21+**（开发环境为 Go 1.26.5）、Windows x64。
+环境要求：**Go 1.21+**（go.mod 已声明 `go 1.21`）、Windows x64。
 **不需要 gcc**（全项目 CGO_ENABLED=0，仅依赖纯 Go 的 `lxn/walk`）。
 
 ```bash
@@ -85,7 +85,14 @@ go build -trimpath -ldflags "-H windowsgui -s -w" -o sangfor-ifaces-gui.exe .
 
 ```
 .
-├── main.go                     # 全部逻辑：vapi 协议客户端 + Walk 界面
+├── main.go                     # 入口：package 文档 + main()（仅 100 行）
+├── api.go                      # vapi 协议层：数据结构 + Client（登录/查询/写操作）+ 会话/输入缓存
+├── ui.go                       # 桌面 GUI（Walk/Win32）：显示辅助 + 数据模型 + App + 各页构建 + 主窗口
+├── netcfg.go                   # 4 类网络配置写操作的客户端与纯函数校验工具
+├── netcfg_pages.go             # 4 个网络配置页的页面与业务逻辑
+├── netcfg_ui.go                # 网络配置页的控件与表格模型
+├── harcapture.go               # 调试抓包（HAR）实现
+├── netcfg_test.go              # 纯函数单元测试（IP/网段/交集/候选口/UUID 等）
 ├── app.manifest / rsrc.syso    # 窗口清单资源（现代样式 + PerMonitorV2 DPI）
 ├── build.bat                   # 一键构建
 ├── go.mod / go.sum

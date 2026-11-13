@@ -255,7 +255,7 @@ func (p *netCfgPages) onPoolPreview() {
 
 func (p *netCfgPages) onPoolSubmit() {
 	a := p.app
-	if a.client == nil {
+	if a.getClient() == nil {
 		walk.MsgBox(a, "提示", "请先登录设备。", walk.MsgBoxIconInformation)
 		return
 	}
@@ -281,7 +281,7 @@ func (p *netCfgPages) onPoolSubmit() {
 	p.poolPreview.SetEnabled(false)
 	p.poolSubmit.SetText("执行中...")
 	p.setPoolStat("正在下发 VXLAN IP 池...")
-	client := a.client
+	client := a.getClient()
 	go func() {
 		pool, err := client.CreateVXLANIPPool(ips, mask, gw, nodeIDs, desc)
 		if err != nil {
@@ -582,7 +582,7 @@ func (p *netCfgPages) onBondPreview() {
 
 func (p *netCfgPages) onBondSubmit() {
 	a := p.app
-	if a.client == nil {
+	if a.getClient() == nil {
 		walk.MsgBox(a, "提示", "请先登录设备。", walk.MsgBoxIconInformation)
 		return
 	}
@@ -610,7 +610,7 @@ func (p *netCfgPages) onBondSubmit() {
 	p.bondPreview.SetEnabled(false)
 	p.bondSubmit.SetText("执行中...")
 	p.setBondStat("正在创建聚合口...")
-	client := a.client
+	client := a.getClient()
 	go func() {
 		taskID, err := client.CreateBonds(specs)
 		if err != nil {
@@ -918,7 +918,7 @@ func (p *netCfgPages) onVSPreview() {
 // onVSSubmit 第一阶段：本地校验 + 设备侧预校验（不写入）
 func (p *netCfgPages) onVSSubmit() {
 	a := p.app
-	if a.client == nil {
+	if a.getClient() == nil {
 		walk.MsgBox(a, "提示", "请先登录设备。", walk.MsgBoxIconInformation)
 		return
 	}
@@ -930,7 +930,7 @@ func (p *netCfgPages) onVSSubmit() {
 	p.vsSubmit.SetEnabled(false)
 	p.vsSubmit.SetText("校验中...")
 	p.setVSStat("正在执行设备侧网段冲突校验...")
-	client := a.client
+	client := a.getClient()
 	go func() {
 		warnInfo, warnLevel, err := client.CheckArbiterSameNetIP(list)
 		a.post("nc_vs_checked", err, vsChecked{list: list, rows: rows, warn: warnInfo, level: warnLevel})
@@ -962,7 +962,7 @@ func (p *netCfgPages) onVSConfirm(ck vsChecked) {
 
 	p.vsSubmit.SetText("执行中...")
 	p.setVSStat("正在下发存储网配置...")
-	client := a.client
+	client := a.getClient()
 	list := ck.list
 	go func() {
 		upid, err := client.SetVSNetworkSetting(list)
@@ -1142,7 +1142,7 @@ func (p *netCfgPages) onBizPreview() {
 // onBizSubmit 第一阶段：本地校验 + 设备侧接入检查（不写入）
 func (p *netCfgPages) onBizSubmit() {
 	a := p.app
-	if a.client == nil {
+	if a.getClient() == nil {
 		walk.MsgBox(a, "提示", "请先登录设备。", walk.MsgBoxIconInformation)
 		return
 	}
@@ -1154,7 +1154,7 @@ func (p *netCfgPages) onBizSubmit() {
 	p.bizSubmit.SetEnabled(false)
 	p.bizSubmit.SetText("校验中...")
 	p.setBizStat("正在执行设备侧接入检查...")
-	client := a.client
+	client := a.getClient()
 	hostEth := map[string][]string{}
 	for _, id := range nodeIDs {
 		hostEth[id] = []string{vlink}
@@ -1190,7 +1190,7 @@ func (p *netCfgPages) onBizConfirm(ck bizChecked) {
 
 	p.bizSubmit.SetText("执行中...")
 	p.setBizStat("正在创建业务口...")
-	client := a.client
+	client := a.getClient()
 	bridges := make([]NetPortalBridge, 0, len(ck.nodeIDs))
 	for _, id := range ck.nodeIDs {
 		bridges = append(bridges, NewNetPortalBridge(id, ck.vlink))
@@ -1230,7 +1230,7 @@ func (p *netCfgPages) copyBizState() {
 // ---------- 后台拉取 ----------
 
 func (p *netCfgPages) fetchPools() {
-	c := p.app.client
+	c := p.app.getClient()
 	if c == nil {
 		return
 	}
@@ -1243,7 +1243,7 @@ func (p *netCfgPages) fetchPools() {
 }
 
 func (p *netCfgPages) fetchBonds() {
-	c := p.app.client
+	c := p.app.getClient()
 	if c == nil {
 		return
 	}
@@ -1256,7 +1256,7 @@ func (p *netCfgPages) fetchBonds() {
 }
 
 func (p *netCfgPages) fetchVS() {
-	c := p.app.client
+	c := p.app.getClient()
 	if c == nil {
 		return
 	}
@@ -1275,7 +1275,7 @@ func (p *netCfgPages) fetchVS() {
 }
 
 func (p *netCfgPages) fetchBiz() {
-	c := p.app.client
+	c := p.app.getClient()
 	if c == nil {
 		return
 	}
@@ -1303,29 +1303,21 @@ func (p *netCfgPages) refreshAll() {
 
 // ---------- 状态与标签 ----------
 
-func (p *netCfgPages) setPoolStat(s string) {
-	if p.poolStat != nil {
-		p.poolStat.SetText(s)
+// setStat 更新某个状态标签（标签可能为 nil）。
+// 四个页面的 setXStat 仅是本函数的薄封装，避免每个页面重复一遍 nil 判断。
+func (p *netCfgPages) setStat(label **walk.Label, s string) {
+	if *label != nil {
+		(*label).SetText(s)
 	}
 }
 
-func (p *netCfgPages) setBondStat(s string) {
-	if p.bondStat != nil {
-		p.bondStat.SetText(s)
-	}
-}
+func (p *netCfgPages) setPoolStat(s string) { p.setStat(&p.poolStat, s) }
 
-func (p *netCfgPages) setVSStat(s string) {
-	if p.vsStat != nil {
-		p.vsStat.SetText(s)
-	}
-}
+func (p *netCfgPages) setBondStat(s string) { p.setStat(&p.bondStat, s) }
 
-func (p *netCfgPages) setBizStat(s string) {
-	if p.bizStat != nil {
-		p.bizStat.SetText(s)
-	}
-}
+func (p *netCfgPages) setVSStat(s string) { p.setStat(&p.vsStat, s) }
+
+func (p *netCfgPages) setBizStat(s string) { p.setStat(&p.bizStat, s) }
 
 // nodeLabel 返回 "管理IP (hostid)" 形式，取不到时退回 hostid
 func (p *netCfgPages) nodeLabel(hostID string) string {
